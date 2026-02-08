@@ -180,8 +180,8 @@ def list_restaurants(
     if vegetarian_type: where.append("r.vegetarian_type = %s"); params.append(vegetarian_type)
     if search:
         q = f"%{search}%"
-        where.append("(r.name LIKE %s OR r.name_en LIKE %s OR r.address LIKE %s)")
-        params.extend([q, q, q])
+        where.append("(r.name LIKE %s OR r.name_en LIKE %s OR r.address LIKE %s OR r.phone LIKE %s OR r.phone2 LIKE %s OR r.intro LIKE %s)")
+        params.extend([q, q, q, q, q, q])
     if time_slot:
         where.append("JSON_CONTAINS(r.time_slots, %s)")
         params.append(json.dumps(time_slot))
