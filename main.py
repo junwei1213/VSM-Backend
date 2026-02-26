@@ -1,5 +1,6 @@
 """
-GoVeggie Q1 API - connects Flutter App to goveggie_q1 MySQL database
+GoVeggie API v2.0 - Q1 Version
+Database: goveggie_v4
 Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
@@ -13,10 +14,10 @@ import json
 import os
 import jwt
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel
 
-app = FastAPI(title="GoVeggie Q1 API", version="1.0")
+app = FastAPI(title="GoVeggie API v2.0", version="2.0")
 
 # Security
 SECRET_KEY = "vsm-super-secret-key-for-jwt-2026"
@@ -45,10 +46,9 @@ async def verify_token_or_key(
     api_key: Optional[str] = Query(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    # For Beta: Allow all GET requests for now to debug connectivity
     if request.method == "GET":
         return {"sub": "beta_guest", "role": "guest"}
-        
+    
     key = x_api_key or api_key
     if key == STATIC_API_KEY:
         return {"sub": "static_client", "role": "guest"}
@@ -61,8 +61,15 @@ async def verify_token_or_key(
 def get_current_user(payload: dict = Depends(verify_token)):
     return payload
 
-# Photo storage path (local images scraped from old system)
+def require_admin(user: dict = Depends(verify_token)):
+    if user.get('role') not in ['admin', 'super_admin']:
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
+
+# Photo storage path
 PHOTO_DIR = "/Users/justin/python/GoVeggie/data/images"
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,7 +82,7 @@ def get_db():
     return mysql.connector.connect(
         host="localhost",
         user="root",
-        database="goveggie_q1",
+        database="goveggie_v4",
         charset="utf8mb4",
     )
 
@@ -88,39 +95,40 @@ def parse_json_field(val):
 
 def row_to_dict(row):
     from decimal import Decimal
-    json_fields = ['time_slots', 'rest_days', 'diet_tags', 'food_tags', 'facility_tags', 'photos']
+    json_fields = ['phones', 'time_slots', 'rest_days', 'diet_tags', 'food_tags', 'facility_tags', 'photos', 'business_hours', 'device_tokens', 'preferences']
     for f in json_fields:
         if f in row: row[f] = parse_json_field(row[f])
     for key, value in row.items():
         if isinstance(value, Decimal): row[key] = float(value)
     return row
 
+# ============================================================
+# Auth Endpoints
+# ============================================================
+
 class SocialLoginRequest(BaseModel):
-    provider: str  # "google" or "apple"
-    provider_id: str  # Google sub / Apple user ID
+    provider: str
+    provider_id: str
     email: Optional[str] = None
     name: Optional[str] = None
     avatar_url: Optional[str] = None
 
 @app.post("/api/auth/social-login")
 def social_login(req: SocialLoginRequest):
-    if req.provider not in ("google", "apple"):
+    if req.provider not in ("google", "apple", "facebook", "huawei"):
         raise HTTPException(status_code=400, detail="Unsupported provider")
     db = get_db(); cursor = db.cursor(dictionary=True)
     try:
-        # 1. Try find by provider + provider_id
         cursor.execute("SELECT * FROM users WHERE auth_provider=%s AND auth_provider_id=%s", (req.provider, req.provider_id))
         user = cursor.fetchone()
         if not user and req.email:
-            # 2. Try find by email (might have logged in with different provider before)
             cursor.execute("SELECT * FROM users WHERE email=%s", (req.email,))
             user = cursor.fetchone()
             if user:
-                # Link this provider to existing account
-                cursor.execute("UPDATE users SET auth_provider=%s, auth_provider_id=%s, last_login_at=NOW() WHERE id=%s", (req.provider, req.provider_id, user['id']))
+                cursor.execute("UPDATE users SET auth_provider=%s, auth_provider_id=%s, last_login_at=NOW() WHERE id=%s", 
+                             (req.provider, req.provider_id, user['id']))
                 db.commit()
         if not user:
-            # 3. Create new user
             admin_emails = ["admin@vsm.org.my", "justinjunwei2002@gmail.com", "iuqe12@gmail.com"]
             role = "admin" if req.email in admin_emails else "user"
             cursor.execute(
@@ -145,10 +153,9 @@ class BindPhoneRequest(BaseModel):
 def bind_phone(req: BindPhoneRequest, user: dict = Depends(verify_token)):
     db = get_db(); cursor = db.cursor()
     try:
-        # Check if phone already taken by another user
         cursor.execute("SELECT id FROM users WHERE phone=%s AND id!=%s", (req.phone, user['uid']))
         if cursor.fetchone():
-            raise HTTPException(status_code=409, detail="Phone already linked to another account")
+            raise HTTPException(status_code=409, detail="Phone already linked")
         cursor.execute("UPDATE users SET phone=%s WHERE id=%s", (req.phone, user['uid']))
         db.commit(); return {"ok": True}
     finally: cursor.close(); db.close()
@@ -157,61 +164,793 @@ def bind_phone(req: BindPhoneRequest, user: dict = Depends(verify_token)):
 def get_me(user: dict = Depends(verify_token)):
     db = get_db(); cursor = db.cursor(dictionary=True)
     try:
-        cursor.execute("SELECT id, phone, email, name, avatar_url, role, created_at FROM users WHERE id=%s", (user['uid'],))
+        cursor.execute("SELECT id, phone, email, name, avatar_url, role, preferences, created_at FROM users WHERE id=%s", (user['uid'],))
         u = cursor.fetchone()
         if not u: raise HTTPException(status_code=404, detail="User not found")
-        return u
+        return row_to_dict(u)
     finally: cursor.close(); db.close()
+
+# ============================================================
+# Restaurants Endpoints
+# ============================================================
 
 @app.get("/api/restaurants", dependencies=[Depends(verify_token_or_key)])
 def list_restaurants(
-    state_id: Optional[int] = None, area_id: Optional[int] = None,
-    category: Optional[str] = None, vegetarian_type: Optional[str] = None,
-    status: Optional[str] = "active", search: Optional[str] = None,
-    time_slot: Optional[str] = None, lat: Optional[float] = None, lng: Optional[float] = None,
-    page: int = 1, limit: int = 50
+    # 基础筛选
+    state_id: Optional[int] = None,
+    area: Optional[str] = None,
+    search: Optional[str] = None,
+    
+    # 价格筛选
+    price_level: Optional[int] = None,
+    price_min: Optional[int] = None,
+    price_max: Optional[int] = None,
+    
+    # 特色筛选
+    recommended: Optional[bool] = None,
+    
+    # 时间筛选
+    time_slot: Optional[str] = None,  # morning, afternoon, evening
+    is_open_now: Optional[bool] = None,
+    
+    # 地理位置排序
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    radius: Optional[int] = 50000,  # 默认50km
+    
+    # 排序
+    sort_by: Optional[str] = Query(None, description="排序方式: distance, newest, recommended (Q1: 无rating/saves)"),
+    
+    # 分页
+    page: int = 1,
+    limit: int = 50
 ):
+    """
+    增强版餐厅搜索 API
+    
+    搜索字段: 名称(中英文)、地址、推荐菜、描述、电话
+    
+    筛选条件:
+    - state_id: 州属ID
+    - area: 地区名称(如"Kuala Lumpur")
+    - price_level: 价格等级(1-3)
+    - price_min/price_max: 价格范围
+    - recommended: 是否推荐餐厅
+    - time_slot: 营业时段(morning/afternoon/evening)
+    - is_open_now: 是否正在营业
+    
+    排序 (Q1版本无rating/saves):
+    - distance: 距离最近(需lat/lng)
+    - newest: 最新加入
+    - recommended: 推荐优先
+    """
     db = get_db(); cursor = db.cursor(dictionary=True)
-    where = []; params = []
-    if status: where.append("r.status = %s"); params.append(status)
-    if state_id: where.append("r.state_id = %s"); params.append(state_id)
-    if area_id: where.append("r.area_id = %s"); params.append(area_id)
-    if category: where.append("r.category = %s"); params.append(category)
-    if vegetarian_type: where.append("r.vegetarian_type = %s"); params.append(vegetarian_type)
+    where = ["1=1"]; params = []
+    joins = []
+
+    # 1. 州属筛选 (通过 state_id 查找 state 名称)
+    if state_id:
+        cursor.execute("SELECT name FROM states WHERE id = %s", (state_id,))
+        state_row = cursor.fetchone()
+        if state_row:
+            where.append("r.state = %s")
+            params.append(state_row['name'])
+    
+    # 2. 地区筛选 (直接匹配 area 名称)
+    if area:
+        where.append("r.area = %s")
+        params.append(area)
+    
+    # 3. 增强搜索 (多字段模糊搜索)
     if search:
         q = f"%{search}%"
-        where.append("(r.name LIKE %s OR r.name_en LIKE %s OR r.address LIKE %s OR r.phone LIKE %s OR r.phone2 LIKE %s OR r.intro LIKE %s)")
-        params.extend([q, q, q, q, q, q])
-    if time_slot:
-        where.append("JSON_CONTAINS(r.time_slots, %s)")
-        params.append(json.dumps(time_slot))
+        # 支持中英文名称、地址、推荐菜、描述、电话
+        search_conditions = [
+            "r.name_zh LIKE %s", 
+            "r.name_en LIKE %s",
+            "r.address LIKE %s",
+            "r.recommended_dishes LIKE %s",
+            "r.description LIKE %s",
+            "JSON_SEARCH(r.phones, 'one', %s) IS NOT NULL"  # 搜索电话号码
+        ]
+        where.append(f"({' OR '.join(search_conditions)})")
+        params.extend([q, q, q, q, q, search])  # phones 用原始搜索词
     
-    where_str = " AND ".join(where) if where else "1=1"
-    offset = (page - 1) * limit
-    dist_select = ""; order_by = "r.id DESC" # Default to newest or stable order
+    # 4. 价格筛选
+    if price_level is not None:
+        where.append("r.price_level = %s")
+        params.append(price_level)
+    if price_min is not None:
+        where.append("r.price_level >= %s")
+        params.append(price_min)
+    if price_max is not None:
+        where.append("r.price_level <= %s")
+        params.append(price_max)
+    
+    # 5. 推荐餐厅筛选
+    if recommended is not None:
+        if recommended:
+            where.append("r.recommended = 1")
+        else:
+            where.append("(r.recommended = 0 OR r.recommended IS NULL)")
+    
+    # 6. 营业时段筛选 (time_slots JSON)
+    if time_slot:
+        valid_slots = ['morning', 'afternoon', 'evening', 'night']
+        if time_slot in valid_slots:
+            where.append("JSON_CONTAINS(r.time_slots, %s)")
+            params.append(json.dumps(time_slot))
+    
+    # 8. 正在营业筛选
+    if is_open_now:
+        # 获取当前时间
+        now = datetime.now()
+        current_time = now.strftime("%H:%M")
+        current_day = now.strftime("%A")  # Monday, Tuesday...
+        # 简化版：检查 rest_days 不包含今天
+        where.append("(r.rest_days IS NULL OR r.rest_days NOT LIKE %s)")
+        params.append(f"%{current_day}%")
+    
+    # 9. 距离筛选和排序
+    dist_select = ""
+    dist_where = ""
+    order_by = "r.id DESC"  # 默认排序
+    
     if lat is not None and lng is not None:
         try:
             f_lat = float(lat); f_lng = float(lng)
-            if abs(f_lat) > 0.1: # Only sort by distance if lat/lng are non-zero
-                dist_select = f", (6371000 * acos(least(1.0, cos(radians({f_lat})) * cos(radians(r.lat)) * cos(radians(r.lng) - radians({f_lng})) + sin(radians({f_lat})) * sin(radians(r.lat))))) AS distance_m"
-                order_by = "distance_m ASC"
-        except: pass
+            if abs(f_lat) > 0.1:
+                # 计算距离
+                dist_select = f", (6371000 * acos(least(1.0, cos(radians({f_lat})) * cos(radians(r.location_lat)) * cos(radians(r.location_lng) - radians({f_lng})) + sin(radians({f_lat})) * sin(radians(r.location_lat))))) AS distance_m"
+                # 限制半径
+                dist_where = f" AND (6371000 * acos(least(1.0, cos(radians({f_lat})) * cos(radians(r.location_lat)) * cos(radians(r.location_lng) - radians({f_lng})) + sin(radians({f_lat})) * sin(radians(r.location_lat))))) <= {radius}"
+                
+                # 根据 sort_by 参数决定排序
+                if sort_by == "distance":
+                    order_by = "distance_m ASC"
+        except:
+            pass
     
-    cursor.execute(f"SELECT COUNT(*) as total FROM restaurants r WHERE {where_str}", params)
-    total = cursor.fetchone()['total']
-    sql = f"SELECT r.*, s.name as state_name, s.name_zh as state_name_zh, a.name as area_name, a.name_zh as area_name_zh {dist_select} FROM restaurants r LEFT JOIN states s ON s.id = r.state_id LEFT JOIN areas a ON a.id = r.area_id WHERE {where_str} ORDER BY {order_by} LIMIT %s OFFSET %s"
-    cursor.execute(sql, params + [limit, offset])
+    # 排序处理 (Q1版本: 无rating/saves排序)
+    if sort_by == "newest":
+        order_by = "r.created_at DESC"
+    elif sort_by == "recommended":
+        order_by = "r.recommended DESC, r.id DESC"  # 推荐优先，其次按ID
+    elif sort_by == "distance" and not (lat and lng):
+        # 如果没有提供坐标，忽略距离排序
+        order_by = "r.id DESC"
+    
+    where_str = " AND ".join(where)
+    offset = (page - 1) * limit
+    
+    # 构建最终 SQL (WHERE 条件参数 + 分页参数)
+    sql_params = params.copy()
+    sql = f"""SELECT r.*, 
+                     s.name as state_name, s.name_zh as state_name_zh, 
+                     a.area as area_name, a.area_zh as area_name_zh
+                     {dist_select}
+              FROM restaurants r 
+              LEFT JOIN states s ON CAST(s.name AS CHAR CHARACTER SET utf8mb4) = CAST(r.state AS CHAR CHARACTER SET utf8mb4)
+              LEFT JOIN areas a ON CAST(a.area AS CHAR CHARACTER SET utf8mb4) = CAST(r.area AS CHAR CHARACTER SET utf8mb4)
+              WHERE {where_str} {dist_where}
+              ORDER BY {order_by}
+              LIMIT %s OFFSET %s"""
+    sql_params.extend([limit, offset])
+    
+    # 执行查询
+    cursor.execute(sql, sql_params)
     rows = [row_to_dict(r) for r in cursor.fetchall()]
+    
+    # 获取总数 (使用原始 params，不包含分页参数)
+    count_sql = f"SELECT COUNT(*) as total FROM restaurants r WHERE {where_str}"
+    cursor.execute(count_sql, params)
+    total = cursor.fetchone()['total']
+    
     cursor.close(); db.close()
-    return {"total": total, "page": page, "limit": limit, "data": rows}
+    
+    return {
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "filters_applied": {
+            "state_id": state_id,
+            "area": area,
+            "search": search,
+            "price_level": price_level,
+            "price_range": {"min": price_min, "max": price_max} if (price_min or price_max) else None,
+            "recommended": recommended,
+            "time_slot": time_slot,
+            "is_open_now": is_open_now,
+            "sort_by": sort_by,
+            "location": {"lat": lat, "lng": lng, "radius": radius} if lat and lng else None
+        },
+        "data": rows
+    }
 
 @app.get("/api/restaurants/{restaurant_id}")
 def get_restaurant(restaurant_id: int):
     db = get_db(); cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT r.*, s.name as state_name, s.name_zh as state_name_zh, a.name as area_name, a.name_zh as area_name_zh FROM restaurants r LEFT JOIN states s ON s.id = r.state_id LEFT JOIN areas a ON a.id = r.area_id WHERE r.id = %s", (restaurant_id,))
+    cursor.execute("""SELECT r.*, s.name as state_name, s.name_zh as state_name_zh, 
+                        a.area as area_name, a.area_zh as area_name_zh 
+                      FROM restaurants r 
+                      LEFT JOIN states s ON CAST(s.name AS CHAR CHARACTER SET utf8mb4) = CAST(r.state AS CHAR CHARACTER SET utf8mb4)
+                      LEFT JOIN areas a ON CAST(a.area AS CHAR CHARACTER SET utf8mb4) = CAST(r.area AS CHAR CHARACTER SET utf8mb4)
+                      WHERE r.id = %s""", (restaurant_id,))
     row = cursor.fetchone(); cursor.close(); db.close()
-    if not row: return {"error": "Not found"}, 404
+    if not row: raise HTTPException(status_code=404, detail="Not found")
     return row_to_dict(row)
+
+
+@app.get("/api/search/suggestions")
+def search_suggestions(
+    q: str = Query(..., min_length=1, description="搜索关键词"),
+    limit: int = 10
+):
+    """
+    搜索建议 API - 返回餐厅名称、地区、推荐菜等建议
+    用于搜索框自动补全
+    """
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    suggestions = []
+    
+    try:
+        search_q = f"%{q}%"
+        
+        # 1. 搜索餐厅名称 (中英文)
+        cursor.execute("""
+            SELECT DISTINCT 
+                CASE 
+                    WHEN name_zh LIKE %s AND name_zh IS NOT NULL THEN name_zh
+                    ELSE name_en 
+                END as name,
+                state, area
+            FROM restaurants 
+            WHERE (name_zh LIKE %s OR name_en LIKE %s)
+            AND (name_zh IS NOT NULL OR name_en IS NOT NULL)
+            LIMIT %s
+        """, (search_q, search_q, search_q, limit))
+        
+        for row in cursor.fetchall():
+            if row['name']:
+                suggestions.append({
+                    "type": "restaurant",
+                    "text": row['name'],
+                    "location": f"{row['state']}, {row['area']}" if row['area'] else row['state']
+                })
+        
+        # 2. 搜索地区
+        if len(suggestions) < limit:
+            cursor.execute("""
+                SELECT DISTINCT area, state 
+                FROM areas 
+                WHERE area LIKE %s OR area_zh LIKE %s
+                LIMIT %s
+            """, (search_q, search_q, limit - len(suggestions)))
+            
+            for row in cursor.fetchall():
+                suggestions.append({
+                    "type": "area",
+                    "text": row['area'],
+                    "state": row['state']
+                })
+        
+        # 3. 搜索推荐菜
+        if len(suggestions) < limit:
+            cursor.execute("""
+                SELECT DISTINCT recommended_dishes
+                FROM restaurants 
+                WHERE recommended_dishes LIKE %s
+                LIMIT %s
+            """, (search_q, limit - len(suggestions)))
+            
+            for row in cursor.fetchall():
+                if row['recommended_dishes']:
+                    # 简单拆分推荐菜
+                    dishes = row['recommended_dishes'].replace('，', ',').split(',')
+                    for dish in dishes[:3]:  # 最多取3个
+                        dish = dish.strip()
+                        if q.lower() in dish.lower() and len(suggestions) < limit:
+                            suggestions.append({
+                                "type": "dish",
+                                "text": dish
+                            })
+        
+        # 4. 热门搜索关键词 (基于搜索历史或预设)
+        hot_keywords = ["素食", "vegan", "火锅", "早餐", "经济饭", "咖啡", "Kuala Lumpur", "Penang"]
+        matching_hot = [k for k in hot_keywords if q.lower() in k.lower()]
+        for kw in matching_hot[:3]:
+            if len(suggestions) < limit:
+                suggestions.append({
+                    "type": "hot",
+                    "text": kw
+                })
+        
+    finally:
+        cursor.close(); db.close()
+    
+    return {
+        "query": q,
+        "suggestions": suggestions[:limit]
+    }
+
+
+@app.get("/api/search/filters")
+def get_search_filters():
+    """
+    获取所有可用的搜索筛选选项
+    用于前端筛选器展示
+    """
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    
+    try:
+        # 价格等级 (Q1版本: 1-3级)
+        price_levels = [
+            {"value": 1, "label": "$", "label_en": "Budget", "label_zh": "经济"},
+            {"value": 2, "label": "$$", "label_en": "Moderate", "label_zh": "中等"},
+            {"value": 3, "label": "$$$", "label_en": "Expensive", "label_zh": "较贵"}
+        ]
+        
+        # 营业时段
+        time_slots = [
+            {"value": "morning", "label": "早餐", "label_en": "Morning", "hours": "6:00 - 11:00"},
+            {"value": "afternoon", "label": "午餐", "label_en": "Afternoon", "hours": "11:00 - 15:00"},
+            {"value": "evening", "label": "晚餐", "label_en": "Evening", "hours": "18:00 - 22:00"},
+            {"value": "night", "label": "宵夜", "label_en": "Night", "hours": "22:00 - 2:00"}
+        ]
+        
+        # 排序选项 (Q1版本: 无rating/saves，favorites表为空)
+        sort_options = [
+            {"value": "recommended", "label": "推荐优先", "label_en": "Recommended"},
+            {"value": "distance", "label": "距离最近", "label_en": "Nearest"},
+            {"value": "newest", "label": "最新加入", "label_en": "Newest"}
+        ]
+        
+        # 特色筛选
+        features = [
+            {"value": "recommended", "label": "推荐餐厅", "label_en": "Recommended"},
+            {"value": "is_open_now", "label": "正在营业", "label_en": "Open Now"}
+        ]
+        
+        return {
+            "price_levels": price_levels,
+            "time_slots": time_slots,
+            "sort_options": sort_options,
+            "features": features
+        }
+    finally:
+        cursor.close(); db.close()
+
+# ============================================================
+# Favorites Endpoints
+# ============================================================
+
+@app.get("/api/favorites")
+def list_favorites(user: dict = Depends(get_current_user)):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT f.restaurant_id, r.name, r.cover_photo, r.lat, r.lng
+            FROM favorites f
+            JOIN restaurants r ON f.restaurant_id = r.id
+            WHERE f.user_id = %s
+        """, (user['uid'],))
+        rows = cursor.fetchall()
+        return {"data": rows}
+    finally: cursor.close(); db.close()
+
+@app.post("/api/favorites/{restaurant_id}")
+def toggle_favorite(restaurant_id: int, user: dict = Depends(get_current_user)):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT id FROM favorites WHERE user_id = %s AND restaurant_id = %s", (user['uid'], restaurant_id))
+        row = cursor.fetchone()
+        if row: 
+            cursor.execute("DELETE FROM favorites WHERE id = %s", (row['id'],))
+            status = "removed"
+        else: 
+            cursor.execute("INSERT INTO favorites (user_id, restaurant_id) VALUES (%s, %s)", (user['uid'], restaurant_id))
+            status = "added"
+        db.commit()
+        return {"ok": True, "status": status}
+    finally: cursor.close(); db.close()
+
+# ============================================================
+# Notifications Endpoints
+# ============================================================
+
+class RegisterDeviceRequest(BaseModel):
+    device_token: str
+    device_type: str  # ios, android, huawei
+    app_version: Optional[str] = None
+
+@app.post("/api/notifications/register-device")
+def register_device(req: RegisterDeviceRequest, user: dict = Depends(verify_token)):
+    """注册设备Token用于推送通知"""
+    db = get_db(); cursor = db.cursor()
+    try:
+        # 检查是否已存在
+        cursor.execute("SELECT id FROM user_devices WHERE device_token = %s", (req.device_token,))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # 更新现有记录
+            cursor.execute("""
+                UPDATE user_devices 
+                SET user_id = %s, device_type = %s, app_version = %s, is_active = 1
+                WHERE device_token = %s
+            """, (user['uid'], req.device_type, req.app_version, req.device_token))
+        else:
+            # 插入新记录
+            cursor.execute("""
+                INSERT INTO user_devices (user_id, device_type, device_token, app_version)
+                VALUES (%s, %s, %s, %s)
+            """, (user['uid'], req.device_type, req.device_token, req.app_version))
+        
+        db.commit()
+        return {"ok": True, "message": "Device registered successfully"}
+    finally: cursor.close(); db.close()
+
+
+@app.get("/api/notifications")
+def list_notifications(
+    user: dict = Depends(get_current_user),
+    page: int = 1, 
+    limit: int = 20,
+    unread_only: bool = False
+):
+    """获取用户通知列表"""
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        where = ["user_id = %s"]; params = [user['uid']]
+        if unread_only:
+            where.append("is_read = 0")
+        
+        where_str = " AND ".join(where)
+        offset = (page - 1) * limit
+        
+        cursor.execute(f"""
+            SELECT * FROM user_notifications 
+            WHERE {where_str}
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """, params + [limit, offset])
+        rows = cursor.fetchall()
+        
+        # 解析JSON数据
+        for row in rows:
+            row['data'] = parse_json_field(row['data'])
+        
+        # 获取未读数量
+        cursor.execute("""
+            SELECT COUNT(*) as unread_count 
+            FROM user_notifications 
+            WHERE user_id = %s AND is_read = 0
+        """, (user['uid'],))
+        unread_count = cursor.fetchone()['unread_count']
+        
+        # 获取总数
+        cursor.execute(f"SELECT COUNT(*) as total FROM user_notifications WHERE {where_str}", params)
+        total = cursor.fetchone()['total']
+        
+        return {
+            "total": total,
+            "unread_count": unread_count,
+            "page": page,
+            "limit": limit,
+            "data": rows
+        }
+    finally: cursor.close(); db.close()
+
+
+@app.get("/api/notifications/unread-count")
+def get_unread_count(user: dict = Depends(get_current_user)):
+    """获取用户未读通知数量"""
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT COUNT(*) as count 
+            FROM user_notifications 
+            WHERE user_id = %s AND is_read = 0
+        """, (user['uid'],))
+        count = cursor.fetchone()['count']
+        return {"unread_count": count}
+    finally: cursor.close(); db.close()
+
+
+@app.post("/api/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: int, user: dict = Depends(get_current_user)):
+    """标记通知为已读"""
+    db = get_db(); cursor = db.cursor()
+    try:
+        cursor.execute("""
+            UPDATE user_notifications 
+            SET is_read = 1, read_at = NOW()
+            WHERE id = %s AND user_id = %s
+        """, (notification_id, user['uid']))
+        db.commit()
+        return {"ok": True, "message": "Marked as read"}
+    finally: cursor.close(); db.close()
+
+
+@app.post("/api/notifications/read-all")
+def mark_all_notifications_read(user: dict = Depends(get_current_user)):
+    """标记所有通知为已读"""
+    db = get_db(); cursor = db.cursor()
+    try:
+        cursor.execute("""
+            UPDATE user_notifications 
+            SET is_read = 1, read_at = NOW()
+            WHERE user_id = %s AND is_read = 0
+        """, (user['uid'],))
+        db.commit()
+        return {"ok": True, "message": "All notifications marked as read"}
+    finally: cursor.close(); db.close()
+
+
+# ============================================================
+# Admin Endpoints
+# ============================================================
+
+@app.get("/api/admin/restaurants")
+def admin_list_restaurants(
+    status: Optional[str] = None,
+    verification: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1, limit: int = 50,
+    user: dict = Depends(require_admin)
+):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        where = ["1=1"]; params = []
+        if status: where.append("r.status = %s"); params.append(status)
+        if verification: where.append("r.verification_status = %s"); params.append(verification)
+        if search:
+            q = f"%{search}%"
+            where.append("(r.name_zh LIKE %s OR r.name_en LIKE %s OR r.address LIKE %s)")
+            params.extend([q, q, q])
+
+        where_str = " AND ".join(where)
+        offset = (page - 1) * limit
+
+        cursor.execute(f"SELECT COUNT(*) as total FROM restaurants r WHERE {where_str}", params)
+        total = cursor.fetchone()['total']
+
+        cursor.execute(f"""
+            SELECT r.*, s.name as state_name, s.name_zh as state_name_zh, a.area as area_name
+            FROM restaurants r
+            LEFT JOIN states s ON CAST(s.name AS CHAR CHARACTER SET utf8mb4)
+                                 = CAST(r.state AS CHAR CHARACTER SET utf8mb4)
+            LEFT JOIN areas a ON CAST(a.area AS CHAR CHARACTER SET utf8mb4)
+                                = CAST(r.area AS CHAR CHARACTER SET utf8mb4)
+            WHERE {where_str}
+            ORDER BY r.created_at DESC
+            LIMIT %s OFFSET %s
+        """, params + [limit, offset])
+        rows = [row_to_dict(r) for r in cursor.fetchall()]
+
+        return {"total": total, "page": page, "limit": limit, "data": rows}
+    finally: cursor.close(); db.close()
+
+@app.get("/api/admin/stats")
+def admin_stats(user: dict = Depends(require_admin)):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    # 全局排除新加坡数据
+    SG_EXCLUDE = "country = 'MY'"
+    try:
+        stats = {}
+        cursor.execute(f"SELECT COUNT(*) as cnt FROM restaurants WHERE status = 'active' AND {SG_EXCLUDE}")
+        stats['total_restaurants'] = cursor.fetchone()['cnt']
+        cursor.execute(f"SELECT COUNT(*) as cnt FROM restaurants WHERE status = 'pending' AND {SG_EXCLUDE}")
+        stats['pending_count'] = cursor.fetchone()['cnt']
+        cursor.execute(f"SELECT COUNT(*) as cnt FROM restaurants WHERE status = 'hidden' AND {SG_EXCLUDE}")
+        stats['hidden_count'] = cursor.fetchone()['cnt']
+        cursor.execute("SELECT COUNT(*) as cnt FROM users")
+        stats['total_users'] = cursor.fetchone()['cnt']
+        cursor.execute("SELECT COUNT(*) as cnt FROM reports WHERE status = 'pending'")
+        stats['pending_reports'] = cursor.fetchone()['cnt']
+
+        # 各州分布（排除新加坡，按数量降序，只取前20）
+        cursor.execute(f"""
+            SELECT COALESCE(s.name_zh, r.state, '未知') as name, COUNT(*) as cnt
+            FROM restaurants r
+            LEFT JOIN states s ON CAST(s.name AS CHAR CHARACTER SET utf8mb4)
+                                 = CAST(r.state AS CHAR CHARACTER SET utf8mb4)
+            WHERE r.status = 'active' AND {SG_EXCLUDE}
+            GROUP BY COALESCE(s.name_zh, r.state)
+            ORDER BY cnt DESC
+            LIMIT 20
+        """)
+        stats['by_state'] = cursor.fetchall()
+
+        # 类别分布（排除新加坡）
+        cursor.execute(f"""
+            SELECT COALESCE(vegetarian_type, '未分类') as category, COUNT(*) as cnt
+            FROM restaurants
+            WHERE status = 'active' AND {SG_EXCLUDE}
+            GROUP BY vegetarian_type
+            ORDER BY cnt DESC
+        """)
+        stats['by_category'] = cursor.fetchall()
+
+        cursor.execute(f"""
+            SELECT verification_status, COUNT(*) as cnt
+            FROM restaurants
+            WHERE {SG_EXCLUDE}
+            GROUP BY verification_status
+        """)
+        stats['by_verification'] = cursor.fetchall()
+
+        return stats
+    finally: cursor.close(); db.close()
+
+
+class SendNotificationRequest(BaseModel):
+    user_ids: Optional[List[int]] = None  # 为空则发送给所有用户
+    type: str  # new_restaurant, announcement, promotion, update
+    title: str
+    content: str
+    data: Optional[dict] = None  # 额外数据（如餐厅ID）
+
+@app.post("/api/admin/notifications/send")
+def admin_send_notification(req: SendNotificationRequest, user: dict = Depends(require_admin)):
+    """管理员发送通知给指定用户或所有用户"""
+    db = get_db(); cursor = db.cursor()
+    try:
+        notification_type = req.type if req.type in ['new_restaurant', 'announcement', 'promotion', 'update'] else 'announcement'
+        
+        if req.user_ids:
+            # 发送给指定用户
+            for uid in req.user_ids:
+                cursor.execute("""
+                    INSERT INTO user_notifications (user_id, type, title, content, data)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (uid, notification_type, req.title, req.content, json.dumps(req.data) if req.data else None))
+            target_count = len(req.user_ids)
+        else:
+            # 发送给所有用户
+            cursor.execute("SELECT id FROM users WHERE is_active = 1")
+            all_users = cursor.fetchall()
+            for u in all_users:
+                cursor.execute("""
+                    INSERT INTO user_notifications (user_id, type, title, content, data)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (u['id'], notification_type, req.title, req.content, json.dumps(req.data) if req.data else None))
+            target_count = len(all_users)
+        
+        db.commit()
+        return {
+            "ok": True, 
+            "message": f"Notification sent to {target_count} users",
+            "target_count": target_count
+        }
+    finally: cursor.close(); db.close()
+
+
+@app.post("/api/admin/notifications/new-restaurant/{restaurant_id}")
+def admin_notify_new_restaurant(restaurant_id: int, user: dict = Depends(require_admin)):
+    """通知所有用户有新餐厅上线"""
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        # 获取餐厅信息
+        cursor.execute("SELECT name_zh, name_en, area, state FROM restaurants WHERE id = %s", (restaurant_id,))
+        restaurant = cursor.fetchone()
+        if not restaurant:
+            raise HTTPException(status_code=404, detail="Restaurant not found")
+        
+        restaurant_name = restaurant['name_zh'] or restaurant['name_en'] or 'New Restaurant'
+        location = f"{restaurant['area']}, {restaurant['state']}" if restaurant['area'] else restaurant['state']
+        
+        # 检查是否已发送过通知
+        cursor.execute("SELECT id FROM new_restaurant_notifications WHERE restaurant_id = %s", (restaurant_id,))
+        if cursor.fetchone():
+            return {"ok": False, "message": "Notification already sent for this restaurant"}
+        
+        # 记录已发送
+        cursor.execute("""
+            INSERT INTO new_restaurant_notifications (restaurant_id, notification_sent, sent_at)
+            VALUES (%s, 1, NOW())
+        """, (restaurant_id,))
+        
+        # 发送给所有用户
+        title = f"🎉 新餐厅上线: {restaurant_name}"
+        content = f"{location} 新增一家素食餐厅，快来看看！"
+        data = {"restaurant_id": restaurant_id, "type": "new_restaurant"}
+        
+        cursor.execute("SELECT id FROM users WHERE is_active = 1")
+        all_users = cursor.fetchall()
+        for u in all_users:
+            cursor.execute("""
+                INSERT INTO user_notifications (user_id, type, title, content, data)
+                VALUES (%s, 'new_restaurant', %s, %s, %s)
+            """, (u['id'], title, content, json.dumps(data)))
+        
+        db.commit()
+        return {
+            "ok": True, 
+            "message": f"New restaurant notification sent to {len(all_users)} users",
+            "restaurant_name": restaurant_name
+        }
+    finally: cursor.close(); db.close()
+
+
+# ============================================================
+# Helper Endpoints
+# ============================================================
+
+@app.get("/api/notices")
+def list_notices(
+    type: Optional[str] = None,  # banner, popup
+    limit: int = 5
+):
+    """获取当前活跃的公告/横幅"""
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        where = ["is_active = 1", "(deleted_at IS NULL)"]
+        params = []
+        
+        if type:
+            where.append("type = %s")
+            params.append(type)
+        
+        where_str = " AND ".join(where)
+        
+        cursor.execute(f"""
+            SELECT id, type, content, info, image_url, link_name, links, priority, created_at
+            FROM notices
+            WHERE {where_str}
+            ORDER BY priority DESC, created_at DESC
+            LIMIT %s
+        """, params + [limit])
+        
+        rows = cursor.fetchall()
+        for row in rows:
+            row['links'] = parse_json_field(row['links'])
+        
+        return {"data": rows}
+    finally: cursor.close(); db.close()
+
+
+@app.get("/api/states")
+def list_states():
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT * FROM states 
+            WHERE is_active = 1 
+            ORDER BY sort_order, name
+        """)
+        states = cursor.fetchall()
+        
+        cursor.execute("SELECT state, COUNT(DISTINCT area) as cnt FROM areas GROUP BY state")
+        area_counts = {row['state']: row['cnt'] for row in cursor.fetchall()}
+        
+        for state in states:
+            state['area_count'] = area_counts.get(state['name'], 0)
+        
+        return states
+    finally: cursor.close(); db.close()
+
+@app.get("/api/states/{state_id}/areas")
+def list_areas(state_id: int):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT name FROM states WHERE id = %s", (state_id,))
+        state = cursor.fetchone()
+        if not state:
+            return []
+        cursor.execute("SELECT * FROM areas WHERE state = %s ORDER BY name", (state['name'],))
+        return cursor.fetchall()
+    finally: cursor.close(); db.close()
+
+@app.get("/api/tags")
+def list_tags(type: Optional[str] = None):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        where = "WHERE is_active = 1"
+        if type: where += f" AND type = '{type}'"
+        cursor.execute(f"SELECT * FROM tags {where} ORDER BY type, sort_order, name_en")
+        return cursor.fetchall()
+    finally: cursor.close(); db.close()
 
 @app.get("/api/photos/{legacy_pid}/{filename}")
 async def get_photo(legacy_pid: int, filename: str):
@@ -230,223 +969,15 @@ async def get_photo(legacy_pid: int, filename: str):
     except: pass
     return {"error": "Not found"}, 404
 
-@app.get("/api/states")
-def list_states():
-    db = get_db(); cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT s.*, COUNT(a.id) as area_count FROM states s LEFT JOIN areas a ON a.state_id = s.id WHERE s.is_active = 1 GROUP BY s.id ORDER BY s.sort_order, s.name")
-    rows = cursor.fetchall(); cursor.close(); db.close(); return rows
+# ============================================================
+# Upload Endpoints
+# ============================================================
 
-@app.get("/api/stats")
-def get_stats():
-    db = get_db(); cursor = db.cursor(dictionary=True)
-    stats = {}
-    cursor.execute("SELECT COUNT(*) as cnt FROM restaurants WHERE status = 'active'"); stats['total_restaurants'] = cursor.fetchone()['cnt']
-    cursor.execute("SELECT COUNT(*) as cnt FROM restaurants WHERE status = 'pending'"); stats['pending_count'] = cursor.fetchone()['cnt']
-    cursor.execute("SELECT COUNT(*) as cnt FROM restaurants WHERE status = 'hidden'"); stats['hidden_count'] = cursor.fetchone()['cnt']
-    cursor.execute("SELECT COUNT(*) as cnt FROM users"); stats['total_users'] = cursor.fetchone()['cnt']
-    cursor.execute("SELECT COUNT(*) as cnt FROM reports WHERE status = 'pending'"); stats['pending_reports'] = cursor.fetchone()['cnt']
-    cursor.execute("SELECT COUNT(*) as cnt FROM feedback"); stats['total_feedback'] = cursor.fetchone()['cnt']
-    # By state
-    cursor.execute("SELECT s.name, COUNT(*) as cnt FROM restaurants r JOIN states s ON r.state_id = s.id WHERE r.status='active' GROUP BY s.id ORDER BY cnt DESC LIMIT 8")
-    stats['by_state'] = cursor.fetchall()
-    # By vegetarian type
-    cursor.execute("SELECT vegetarian_type, COUNT(*) as cnt FROM restaurants WHERE status='active' GROUP BY vegetarian_type ORDER BY cnt DESC")
-    stats['by_veg_type'] = cursor.fetchall()
-    # By category
-    cursor.execute("SELECT category, COUNT(*) as cnt FROM restaurants WHERE status='active' GROUP BY category ORDER BY cnt DESC")
-    stats['by_category'] = cursor.fetchall()
-    cursor.close(); db.close(); return stats
-
-@app.get("/api/admin/recent-activity")
-def admin_recent_activity(user: dict = Depends(verify_token)):
-    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
-    db = get_db(); cursor = db.cursor(dictionary=True)
-    activities = []
-    # Recent restaurant submissions
-    cursor.execute("SELECT id, name, status, created_at FROM restaurants ORDER BY created_at DESC LIMIT 5")
-    for r in cursor.fetchall():
-        status_map = {'pending': '待审核', 'active': '已上线', 'hidden': '已隐藏', 'rejected': '已拒绝'}
-        activities.append({"type": "restaurant", "title": f"{'新餐厅申请' if r['status']=='pending' else '餐厅更新'}: {r['name']}", "status": r['status'], "status_text": status_map.get(r['status'], r['status']), "time": str(r['created_at']), "id": r['id']})
-    # Recent reports
-    cursor.execute("SELECT r.id, r.issue_type, r.note, r.created_at, rest.name as restaurant_name FROM reports r LEFT JOIN restaurants rest ON r.restaurant_id = rest.id ORDER BY r.created_at DESC LIMIT 5")
-    for r in cursor.fetchall():
-        activities.append({"type": "report", "title": f"用户报错: {r['restaurant_name'] or '未知'} - {r['issue_type']}", "time": str(r['created_at']), "id": r['id']})
-    # Recent feedback
-    cursor.execute("SELECT id, type, message, created_at FROM feedback ORDER BY created_at DESC LIMIT 3")
-    for r in cursor.fetchall():
-        activities.append({"type": "feedback", "title": f"用户反馈: {r['message'][:30]}...", "time": str(r['created_at']), "id": r['id']})
-    # Sort all by time desc
-    activities.sort(key=lambda x: x['time'], reverse=True)
-    cursor.close(); db.close()
-    return activities[:10]
-
-class RestaurantSubmission(BaseModel):
-    name: str; address: str; name_en: Optional[str] = ""; lat: Optional[float] = None; lng: Optional[float] = None
-    state_id: Optional[int] = None; area_id: Optional[int] = None; country: str = "MY"
-    phone: Optional[str] = ""; phone2: Optional[str] = ""; whatsapp: Optional[str] = ""; facebook: Optional[str] = ""
-    category: str = "restaurant"; vegetarian_type: str = "vegetarian"; price_range: int = 2
-    diet_tags: list[str] = []; food_tags: list[str] = []; facility_tags: list[str] = []
-    time_slots: list[str] = []; working_hours_text: str = ""; rest_days: list[str] = []
-    intro: str = ""; status: str = "pending"; verification: str = "unverified"
-    owner_name: Optional[str] = ""; owner_phone: Optional[str] = ""; admin_notes: str = ""
-
-@app.post("/api/restaurants/submit")
-def submit_restaurant(req: RestaurantSubmission, user: dict = Depends(get_current_user)):
-    db = get_db(); cursor = db.cursor()
-    sql = """INSERT INTO restaurants (name, name_en, address, lat, lng, state_id, area_id, country, phone, facebook, whatsapp, 
-             category, vegetarian_type, price_range, diet_tags, food_tags, facility_tags, time_slots, working_hours_text, 
-             rest_days, intro, admin_notes, status, submitted_by) 
-             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
-    params = (req.name, req.name_en, req.address, req.lat, req.lng, req.state_id, req.area_id, req.country, req.phone, req.facebook, req.whatsapp,
-              req.category, req.vegetarian_type, req.price_range, json.dumps(req.diet_tags), json.dumps(req.food_tags), json.dumps(req.facility_tags), 
-              json.dumps(req.time_slots), req.working_hours_text, json.dumps(req.rest_days), req.intro, req.admin_notes, 'pending', user['uid'])
-    try: cursor.execute(sql, params); db.commit(); return {"ok": True, "id": cursor.lastrowid}
-    finally: cursor.close(); db.close()
-
-@app.post("/api/admin/restaurants")
-def admin_create_restaurant(req: RestaurantSubmission, user: dict = Depends(verify_token)):
-    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
-    db = get_db(); cursor = db.cursor()
-    sql = """INSERT INTO restaurants (name, name_en, address, landmark, lat, lng, state_id, area_id, country, phone, phone2, whatsapp, facebook, 
-             category, vegetarian_type, price_range, diet_tags, food_tags, facility_tags, time_slots, working_hours_text, 
-             rest_days, intro, owner_name, owner_phone, admin_notes, status, verification, reviewed_by, reviewed_at) 
-             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())"""
-    params = (req.name, req.name_en, req.address, "", req.lat, req.lng, req.state_id, req.area_id, req.country, req.phone, req.phone2, req.whatsapp, req.facebook,
-              req.category, req.vegetarian_type, req.price_range, json.dumps(req.diet_tags), json.dumps(req.food_tags), json.dumps(req.facility_tags), 
-              json.dumps(req.time_slots), req.working_hours_text, json.dumps(req.rest_days), req.intro, req.owner_name, req.owner_phone, req.admin_notes, req.status, req.verification, user['uid'])
-    try: cursor.execute(sql, params); db.commit(); return {"ok": True, "id": cursor.lastrowid}
-    finally: cursor.close(); db.close()
-
-@app.put("/api/admin/restaurants/{restaurant_id}")
-def admin_update_restaurant(restaurant_id: int, req: RestaurantSubmission, user: dict = Depends(verify_token)):
-    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
-    db = get_db(); cursor = db.cursor()
-    sql = """UPDATE restaurants SET name=%s, name_en=%s, address=%s, lat=%s, lng=%s, state_id=%s, area_id=%s, phone=%s, phone2=%s, whatsapp=%s, 
-             facebook=%s, category=%s, vegetarian_type=%s, price_range=%s, diet_tags=%s, food_tags=%s, facility_tags=%s, 
-             time_slots=%s, working_hours_text=%s, rest_days=%s, intro=%s, status=%s, verification=%s, owner_name=%s, owner_phone=%s, 
-             admin_notes=%s, reviewed_by=%s, reviewed_at=NOW() WHERE id=%s"""
-    params = (req.name, req.name_en, req.address, req.lat, req.lng, req.state_id, req.area_id, req.phone, req.phone2, req.whatsapp, 
-              req.facebook, req.category, req.vegetarian_type, req.price_range, json.dumps(req.diet_tags), json.dumps(req.food_tags), 
-              json.dumps(req.facility_tags), json.dumps(req.time_slots), req.working_hours_text, json.dumps(req.rest_days), 
-              req.intro, req.status, req.verification, req.owner_name, req.owner_phone, req.admin_notes, user['uid'], restaurant_id)
-    try: cursor.execute(sql, params); db.commit(); return {"ok": True}
-    finally: cursor.close(); db.close()
-
-@app.get("/api/favorites")
-def list_favorites(user: dict = Depends(get_current_user)):
-    db = get_db(); cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT restaurant_id FROM favorites WHERE user_id = %s", (user['uid'],))
-    ids = [r['restaurant_id'] for r in cursor.fetchall()]; cursor.close(); db.close(); return {"ids": ids}
-
-@app.post("/api/favorites/{restaurant_id}")
-def toggle_favorite(restaurant_id: int, user: dict = Depends(get_current_user)):
-    db = get_db(); cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT id FROM favorites WHERE user_id = %s AND restaurant_id = %s", (user['uid'], restaurant_id))
-    row = cursor.fetchone()
-    if row: cursor.execute("DELETE FROM favorites WHERE id = %s", (row['id'],)); status = "removed"
-    else: cursor.execute("INSERT INTO favorites (user_id, restaurant_id) VALUES (%s, %s)", (user['uid'], restaurant_id)); status = "added"
-    db.commit(); cursor.close(); db.close(); return {"ok": True, "status": status}
-
-@app.get("/api/states/{state_id}/areas")
-def list_areas(state_id: int):
-    db = get_db(); cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM areas WHERE state_id = %s ORDER BY name", (state_id,))
-    rows = cursor.fetchall(); cursor.close(); db.close(); return rows
-
-@app.get("/api/tags")
-def list_tags(type: Optional[str] = None):
-    db = get_db(); cursor = db.cursor(dictionary=True)
-    where = "WHERE is_active = 1"
-    if type: where += f" AND type = '{type}'"
-    cursor.execute(f"SELECT * FROM tags {where} ORDER BY type, sort_order, name")
-    rows = cursor.fetchall(); cursor.close(); db.close(); return rows
-
-@app.get("/api/notices")
-def list_notices(active_only: bool = True):
-    db = get_db(); cursor = db.cursor(dictionary=True)
-    where = "WHERE deleted_at IS NULL AND is_active = 1" if active_only else "WHERE deleted_at IS NULL"
-    cursor.execute(f"SELECT * FROM notices {where} ORDER BY priority DESC, created_at DESC")
-    rows = cursor.fetchall()
-    for r in rows:
-        if isinstance(r.get('links'), str): r['links'] = json.loads(r['links'])
-    cursor.close(); db.close(); return rows
-
-class NoticePayload(BaseModel):
-    type: str = "banner"  # banner | popup
-    content: Optional[str] = ""
-    info: Optional[str] = ""
-    image_url: Optional[str] = ""
-    link_name: Optional[str] = ""
-    links: list[dict] = []
-    is_active: bool = True
-    priority: int = 0
-
-@app.post("/api/admin/notices")
-def admin_create_notice(req: NoticePayload, user: dict = Depends(verify_token)):
-    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
-    db = get_db(); cursor = db.cursor()
-    sql = "INSERT INTO notices (type, content, info, image_url, link_name, links, is_active, priority, created_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)"
-    params = (req.type, req.content, req.info, req.image_url, req.link_name, json.dumps(req.links), req.is_active, req.priority, user['uid'])
-    try: cursor.execute(sql, params); db.commit(); return {"ok": True, "id": cursor.lastrowid}
-    finally: cursor.close(); db.close()
-
-@app.put("/api/admin/notices/{notice_id}")
-def admin_update_notice(notice_id: int, req: NoticePayload, user: dict = Depends(verify_token)):
-    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
-    db = get_db(); cursor = db.cursor()
-    sql = "UPDATE notices SET type=%s, content=%s, info=%s, image_url=%s, link_name=%s, links=%s, is_active=%s, priority=%s WHERE id=%s"
-    params = (req.type, req.content, req.info, req.image_url, req.link_name, json.dumps(req.links), req.is_active, req.priority, notice_id)
-    try: cursor.execute(sql, params); db.commit(); return {"ok": True}
-    finally: cursor.close(); db.close()
-
-@app.delete("/api/admin/notices/{notice_id}")
-def admin_delete_notice(notice_id: int, user: dict = Depends(verify_token)):
-    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
-    db = get_db(); cursor = db.cursor()
-    try: cursor.execute("UPDATE notices SET deleted_at=NOW() WHERE id=%s", (notice_id,)); db.commit(); return {"ok": True}
-    finally: cursor.close(); db.close()
-
-class FeedbackSubmission(BaseModel):
-    type: str; message: str; contact: Optional[str] = None
-
-@app.post("/api/feedback")
-def submit_feedback(req: FeedbackSubmission, user: dict = Depends(verify_token_or_key)):
-    db = get_db(); cursor = db.cursor()
-    sql = "INSERT INTO feedback (user_id, type, message, contact) VALUES (%s, %s, %s, %s)"
-    uid = user.get('uid')
-    cursor.execute(sql, (uid, req.type, req.message, req.contact))
-    db.commit(); cursor.close(); db.close(); return {"ok": True}
-
-class ReportSubmission(BaseModel):
-    restaurant_id: int; issue_type: str; details: Optional[str] = None; contact: Optional[str] = None
-
-@app.post("/api/reports")
-def submit_report(req: ReportSubmission, user: dict = Depends(verify_token_or_key)):
-    db = get_db(); cursor = db.cursor()
-    sql = "INSERT INTO reports (restaurant_id, user_id, issue_type, details, contact) VALUES (%s, %s, %s, %s, %s)"
-    uid = user.get('uid')
-    cursor.execute(sql, (req.restaurant_id, uid, req.issue_type, req.details, req.contact))
-    db.commit(); cursor.close(); db.close(); return {"ok": True}
-
-class StatusUpdate(BaseModel):
-    status: str; admin_notes: Optional[str] = None
-
-@app.post("/api/admin/restaurants/{restaurant_id}/status")
-def update_restaurant_status(restaurant_id: int, req: StatusUpdate, user: dict = Depends(verify_token)):
-    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
-    db = get_db(); cursor = db.cursor()
-    sql = "UPDATE restaurants SET status = %s, admin_notes = %s, reviewed_by = %s, reviewed_at = NOW() WHERE id = %s"
-    cursor.execute(sql, (req.status, req.admin_notes, user['uid'], restaurant_id))
-    db.commit(); cursor.close(); db.close(); return {"ok": True}
-
-import os, uuid as _uuid
-
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 @app.post("/api/upload")
 async def upload_photo(file: UploadFile = File(...), user: dict = Depends(verify_token)):
+    import uuid as _uuid
     ext = os.path.splitext(file.filename or "photo.jpg")[1] or ".jpg"
     filename = f"{_uuid.uuid4().hex}{ext}"
     filepath = os.path.join(UPLOAD_DIR, filename)
@@ -455,19 +986,6 @@ async def upload_photo(file: UploadFile = File(...), user: dict = Depends(verify
         f.write(content)
     url = f"/uploads/{filename}"
     return {"ok": True, "url": url, "filename": filename}
-
-@app.post("/api/restaurants/{restaurant_id}/photos")
-def add_restaurant_photos(restaurant_id: int, urls: list[str], user: dict = Depends(verify_token)):
-    db = get_db(); cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT photos, cover_photo FROM restaurants WHERE id=%s", (restaurant_id,))
-    row = cursor.fetchone()
-    if not row: raise HTTPException(status_code=404, detail="Not found")
-    existing = json.loads(row['photos']) if row['photos'] else []
-    existing.extend(urls)
-    cover = row['cover_photo'] or (urls[0] if urls else None)
-    cursor.execute("UPDATE restaurants SET photos=%s, cover_photo=%s WHERE id=%s", (json.dumps(existing), cover, restaurant_id))
-    db.commit(); cursor.close(); db.close()
-    return {"ok": True, "photos": existing}
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,0 +1,474 @@
+"""
+GoVeggie Q1 API - connects Flutter App to goveggie_q1 MySQL database
+Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+"""
+
+from fastapi import FastAPI, Query, Header, HTTPException, Depends, Request, UploadFile, File
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import mysql.connector
+import json
+import os
+import jwt
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+from pydantic import BaseModel
+
+app = FastAPI(title="GoVeggie Q1 API", version="1.0")
+
+# Security
+SECRET_KEY = "vsm-super-secret-key-for-jwt-2026"
+ALGORITHM = "HS256"
+STATIC_API_KEY = "vsm-q1-beta-key-2026"
+security = HTTPBearer(auto_error=False)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(days=365)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+async def verify_token_or_key(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    api_key: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+):
+    # For Beta: Allow all GET requests for now to debug connectivity
+    if request.method == "GET":
+        return {"sub": "beta_guest", "role": "guest"}
+        
+    key = x_api_key or api_key
+    if key == STATIC_API_KEY:
+        return {"sub": "static_client", "role": "guest"}
+    if credentials and credentials.credentials:
+        try:
+            return jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        except: pass
+    raise HTTPException(status_code=403, detail="Invalid credentials")
+
+def get_current_user(payload: dict = Depends(verify_token)):
+    return payload
+
+# Photo storage path (local images scraped from old system)
+PHOTO_DIR = "/Users/justin/python/GoVeggie/data/images"
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def get_db():
+    return mysql.connector.connect(
+        host="localhost",
+        user="root",
+        database="goveggie_v4",
+        charset="utf8mb4",
+    )
+
+def parse_json_field(val):
+    if val is None: return None
+    if isinstance(val, str):
+        try: return json.loads(val)
+        except: return val
+    return val
+
+def row_to_dict(row):
+    from decimal import Decimal
+    json_fields = ['time_slots', 'rest_days', 'diet_tags', 'food_tags', 'facility_tags', 'photos']
+    for f in json_fields:
+        if f in row: row[f] = parse_json_field(row[f])
+    for key, value in row.items():
+        if isinstance(value, Decimal): row[key] = float(value)
+    return row
+
+class SocialLoginRequest(BaseModel):
+    provider: str  # "google" or "apple"
+    provider_id: str  # Google sub / Apple user ID
+    email: Optional[str] = None
+    name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+@app.post("/api/auth/social-login")
+def social_login(req: SocialLoginRequest):
+    if req.provider not in ("google", "apple"):
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        # 1. Try find by provider + provider_id
+        cursor.execute("SELECT * FROM users WHERE auth_provider=%s AND auth_provider_id=%s", (req.provider, req.provider_id))
+        user = cursor.fetchone()
+        if not user and req.email:
+            # 2. Try find by email (might have logged in with different provider before)
+            cursor.execute("SELECT * FROM users WHERE email=%s", (req.email,))
+            user = cursor.fetchone()
+            if user:
+                # Link this provider to existing account
+                cursor.execute("UPDATE users SET auth_provider=%s, auth_provider_id=%s, last_login_at=NOW() WHERE id=%s", (req.provider, req.provider_id, user['id']))
+                db.commit()
+        if not user:
+            # 3. Create new user
+            admin_emails = ["admin@vsm.org.my", "justinjunwei2002@gmail.com", "iuqe12@gmail.com"]
+            role = "admin" if req.email in admin_emails else "user"
+            cursor.execute(
+                "INSERT INTO users (email, name, avatar_url, auth_provider, auth_provider_id, role, is_active, last_login_at) VALUES (%s,%s,%s,%s,%s,%s,1,NOW())",
+                (req.email, req.name, req.avatar_url, req.provider, req.provider_id, role))
+            db.commit(); uid = cursor.lastrowid
+            role_out = role
+        else:
+            uid = user['id']; role_out = user['role']
+            cursor.execute("UPDATE users SET last_login_at=NOW() WHERE id=%s", (uid,))
+            db.commit()
+        token = create_access_token({"sub": str(uid), "uid": uid, "role": role_out})
+        need_phone = True
+        if user and user.get('phone'): need_phone = False
+        return {"token": token, "uid": uid, "role": role_out, "need_phone": need_phone}
+    finally: cursor.close(); db.close()
+
+class BindPhoneRequest(BaseModel):
+    phone: str
+
+@app.post("/api/auth/bind-phone")
+def bind_phone(req: BindPhoneRequest, user: dict = Depends(verify_token)):
+    db = get_db(); cursor = db.cursor()
+    try:
+        # Check if phone already taken by another user
+        cursor.execute("SELECT id FROM users WHERE phone=%s AND id!=%s", (req.phone, user['uid']))
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="Phone already linked to another account")
+        cursor.execute("UPDATE users SET phone=%s WHERE id=%s", (req.phone, user['uid']))
+        db.commit(); return {"ok": True}
+    finally: cursor.close(); db.close()
+
+@app.get("/api/auth/me")
+def get_me(user: dict = Depends(verify_token)):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT id, phone, email, name, avatar_url, role, created_at FROM users WHERE id=%s", (user['uid'],))
+        u = cursor.fetchone()
+        if not u: raise HTTPException(status_code=404, detail="User not found")
+        return u
+    finally: cursor.close(); db.close()
+
+@app.get("/api/restaurants", dependencies=[Depends(verify_token_or_key)])
+def list_restaurants(
+    state_id: Optional[int] = None, area_id: Optional[int] = None,
+    category: Optional[str] = None, vegetarian_type: Optional[str] = None,
+    status: Optional[str] = "active", search: Optional[str] = None,
+    time_slot: Optional[str] = None, lat: Optional[float] = None, lng: Optional[float] = None,
+    page: int = 1, limit: int = 50
+):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    where = []; params = []
+    if status: where.append("r.status = %s"); params.append(status)
+    if state_id: where.append("r.state_id = %s"); params.append(state_id)
+    if area_id: where.append("r.area_id = %s"); params.append(area_id)
+    if category: where.append("r.category = %s"); params.append(category)
+    if vegetarian_type: where.append("r.vegetarian_type = %s"); params.append(vegetarian_type)
+    if search:
+        q = f"%{search}%"
+        where.append("(r.name LIKE %s OR r.name_en LIKE %s OR r.address LIKE %s OR r.phone LIKE %s OR r.phone2 LIKE %s OR r.intro LIKE %s)")
+        params.extend([q, q, q, q, q, q])
+    if time_slot:
+        where.append("JSON_CONTAINS(r.time_slots, %s)")
+        params.append(json.dumps(time_slot))
+    
+    where_str = " AND ".join(where) if where else "1=1"
+    offset = (page - 1) * limit
+    dist_select = ""; order_by = "r.id DESC" # Default to newest or stable order
+    if lat is not None and lng is not None:
+        try:
+            f_lat = float(lat); f_lng = float(lng)
+            if abs(f_lat) > 0.1: # Only sort by distance if lat/lng are non-zero
+                dist_select = f", (6371000 * acos(least(1.0, cos(radians({f_lat})) * cos(radians(r.lat)) * cos(radians(r.lng) - radians({f_lng})) + sin(radians({f_lat})) * sin(radians(r.lat))))) AS distance_m"
+                order_by = "distance_m ASC"
+        except: pass
+    
+    cursor.execute(f"SELECT COUNT(*) as total FROM restaurants r WHERE {where_str}", params)
+    total = cursor.fetchone()['total']
+    sql = f"SELECT r.*, s.name as state_name, s.name_zh as state_name_zh, a.name as area_name, a.name_zh as area_name_zh {dist_select} FROM restaurants r LEFT JOIN states s ON s.id = r.state_id LEFT JOIN areas a ON a.id = r.area_id WHERE {where_str} ORDER BY {order_by} LIMIT %s OFFSET %s"
+    cursor.execute(sql, params + [limit, offset])
+    rows = [row_to_dict(r) for r in cursor.fetchall()]
+    cursor.close(); db.close()
+    return {"total": total, "page": page, "limit": limit, "data": rows}
+
+@app.get("/api/restaurants/{restaurant_id}")
+def get_restaurant(restaurant_id: int):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT r.*, s.name as state_name, s.name_zh as state_name_zh, a.name as area_name, a.name_zh as area_name_zh FROM restaurants r LEFT JOIN states s ON s.id = r.state_id LEFT JOIN areas a ON a.id = r.area_id WHERE r.id = %s", (restaurant_id,))
+    row = cursor.fetchone(); cursor.close(); db.close()
+    if not row: return {"error": "Not found"}, 404
+    return row_to_dict(row)
+
+@app.get("/api/photos/{legacy_pid}/{filename}")
+async def get_photo(legacy_pid: int, filename: str):
+    import httpx
+    file_path = os.path.join(PHOTO_DIR, str(legacy_pid), filename)
+    if os.path.isfile(file_path):
+        return FileResponse(file_path, media_type="image/jpeg")
+    remote_url = f"http://goveggiemalaysia.com/foodlogDB_cms/images/vendorPic/{filename}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(remote_url)
+            if resp.status_code == 200:
+                os.makedirs(os.path.join(PHOTO_DIR, str(legacy_pid)), exist_ok=True)
+                with open(file_path, 'wb') as f: f.write(resp.content)
+                return Response(content=resp.content, media_type="image/jpeg")
+    except: pass
+    return {"error": "Not found"}, 404
+
+@app.get("/api/states")
+def list_states():
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT s.*, COUNT(a.id) as area_count FROM states s LEFT JOIN areas a ON a.state_id = s.id WHERE s.is_active = 1 GROUP BY s.id ORDER BY s.sort_order, s.name")
+    rows = cursor.fetchall(); cursor.close(); db.close(); return rows
+
+@app.get("/api/stats")
+def get_stats():
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    stats = {}
+    cursor.execute("SELECT COUNT(*) as cnt FROM restaurants WHERE status = 'active'"); stats['total_restaurants'] = cursor.fetchone()['cnt']
+    cursor.execute("SELECT COUNT(*) as cnt FROM restaurants WHERE status = 'pending'"); stats['pending_count'] = cursor.fetchone()['cnt']
+    cursor.execute("SELECT COUNT(*) as cnt FROM restaurants WHERE status = 'hidden'"); stats['hidden_count'] = cursor.fetchone()['cnt']
+    cursor.execute("SELECT COUNT(*) as cnt FROM users"); stats['total_users'] = cursor.fetchone()['cnt']
+    cursor.execute("SELECT COUNT(*) as cnt FROM reports WHERE status = 'pending'"); stats['pending_reports'] = cursor.fetchone()['cnt']
+    cursor.execute("SELECT COUNT(*) as cnt FROM feedback"); stats['total_feedback'] = cursor.fetchone()['cnt']
+    # By state
+    cursor.execute("SELECT s.name, COUNT(*) as cnt FROM restaurants r JOIN states s ON r.state_id = s.id WHERE r.status='active' GROUP BY s.id ORDER BY cnt DESC LIMIT 8")
+    stats['by_state'] = cursor.fetchall()
+    # By vegetarian type
+    cursor.execute("SELECT vegetarian_type, COUNT(*) as cnt FROM restaurants WHERE status='active' GROUP BY vegetarian_type ORDER BY cnt DESC")
+    stats['by_veg_type'] = cursor.fetchall()
+    # By category
+    cursor.execute("SELECT category, COUNT(*) as cnt FROM restaurants WHERE status='active' GROUP BY category ORDER BY cnt DESC")
+    stats['by_category'] = cursor.fetchall()
+    cursor.close(); db.close(); return stats
+
+@app.get("/api/admin/recent-activity")
+def admin_recent_activity(user: dict = Depends(verify_token)):
+    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    activities = []
+    # Recent restaurant submissions
+    cursor.execute("SELECT id, name, status, created_at FROM restaurants ORDER BY created_at DESC LIMIT 5")
+    for r in cursor.fetchall():
+        status_map = {'pending': '待审核', 'active': '已上线', 'hidden': '已隐藏', 'rejected': '已拒绝'}
+        activities.append({"type": "restaurant", "title": f"{'新餐厅申请' if r['status']=='pending' else '餐厅更新'}: {r['name']}", "status": r['status'], "status_text": status_map.get(r['status'], r['status']), "time": str(r['created_at']), "id": r['id']})
+    # Recent reports
+    cursor.execute("SELECT r.id, r.issue_type, r.note, r.created_at, rest.name as restaurant_name FROM reports r LEFT JOIN restaurants rest ON r.restaurant_id = rest.id ORDER BY r.created_at DESC LIMIT 5")
+    for r in cursor.fetchall():
+        activities.append({"type": "report", "title": f"用户报错: {r['restaurant_name'] or '未知'} - {r['issue_type']}", "time": str(r['created_at']), "id": r['id']})
+    # Recent feedback
+    cursor.execute("SELECT id, type, message, created_at FROM feedback ORDER BY created_at DESC LIMIT 3")
+    for r in cursor.fetchall():
+        activities.append({"type": "feedback", "title": f"用户反馈: {r['message'][:30]}...", "time": str(r['created_at']), "id": r['id']})
+    # Sort all by time desc
+    activities.sort(key=lambda x: x['time'], reverse=True)
+    cursor.close(); db.close()
+    return activities[:10]
+
+class RestaurantSubmission(BaseModel):
+    name: str; address: str; name_en: Optional[str] = ""; lat: Optional[float] = None; lng: Optional[float] = None
+    state_id: Optional[int] = None; area_id: Optional[int] = None; country: str = "MY"
+    phone: Optional[str] = ""; phone2: Optional[str] = ""; whatsapp: Optional[str] = ""; facebook: Optional[str] = ""
+    category: str = "restaurant"; vegetarian_type: str = "vegetarian"; price_range: int = 2
+    diet_tags: list[str] = []; food_tags: list[str] = []; facility_tags: list[str] = []
+    time_slots: list[str] = []; working_hours_text: str = ""; rest_days: list[str] = []
+    intro: str = ""; status: str = "pending"; verification: str = "unverified"
+    owner_name: Optional[str] = ""; owner_phone: Optional[str] = ""; admin_notes: str = ""
+
+@app.post("/api/restaurants/submit")
+def submit_restaurant(req: RestaurantSubmission, user: dict = Depends(get_current_user)):
+    db = get_db(); cursor = db.cursor()
+    sql = """INSERT INTO restaurants (name, name_en, address, lat, lng, state_id, area_id, country, phone, facebook, whatsapp, 
+             category, vegetarian_type, price_range, diet_tags, food_tags, facility_tags, time_slots, working_hours_text, 
+             rest_days, intro, admin_notes, status, submitted_by) 
+             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+    params = (req.name, req.name_en, req.address, req.lat, req.lng, req.state_id, req.area_id, req.country, req.phone, req.facebook, req.whatsapp,
+              req.category, req.vegetarian_type, req.price_range, json.dumps(req.diet_tags), json.dumps(req.food_tags), json.dumps(req.facility_tags), 
+              json.dumps(req.time_slots), req.working_hours_text, json.dumps(req.rest_days), req.intro, req.admin_notes, 'pending', user['uid'])
+    try: cursor.execute(sql, params); db.commit(); return {"ok": True, "id": cursor.lastrowid}
+    finally: cursor.close(); db.close()
+
+@app.post("/api/admin/restaurants")
+def admin_create_restaurant(req: RestaurantSubmission, user: dict = Depends(verify_token)):
+    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
+    db = get_db(); cursor = db.cursor()
+    sql = """INSERT INTO restaurants (name, name_en, address, landmark, lat, lng, state_id, area_id, country, phone, phone2, whatsapp, facebook, 
+             category, vegetarian_type, price_range, diet_tags, food_tags, facility_tags, time_slots, working_hours_text, 
+             rest_days, intro, owner_name, owner_phone, admin_notes, status, verification, reviewed_by, reviewed_at) 
+             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())"""
+    params = (req.name, req.name_en, req.address, "", req.lat, req.lng, req.state_id, req.area_id, req.country, req.phone, req.phone2, req.whatsapp, req.facebook,
+              req.category, req.vegetarian_type, req.price_range, json.dumps(req.diet_tags), json.dumps(req.food_tags), json.dumps(req.facility_tags), 
+              json.dumps(req.time_slots), req.working_hours_text, json.dumps(req.rest_days), req.intro, req.owner_name, req.owner_phone, req.admin_notes, req.status, req.verification, user['uid'])
+    try: cursor.execute(sql, params); db.commit(); return {"ok": True, "id": cursor.lastrowid}
+    finally: cursor.close(); db.close()
+
+@app.put("/api/admin/restaurants/{restaurant_id}")
+def admin_update_restaurant(restaurant_id: int, req: RestaurantSubmission, user: dict = Depends(verify_token)):
+    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
+    db = get_db(); cursor = db.cursor()
+    sql = """UPDATE restaurants SET name=%s, name_en=%s, address=%s, lat=%s, lng=%s, state_id=%s, area_id=%s, phone=%s, phone2=%s, whatsapp=%s, 
+             facebook=%s, category=%s, vegetarian_type=%s, price_range=%s, diet_tags=%s, food_tags=%s, facility_tags=%s, 
+             time_slots=%s, working_hours_text=%s, rest_days=%s, intro=%s, status=%s, verification=%s, owner_name=%s, owner_phone=%s, 
+             admin_notes=%s, reviewed_by=%s, reviewed_at=NOW() WHERE id=%s"""
+    params = (req.name, req.name_en, req.address, req.lat, req.lng, req.state_id, req.area_id, req.phone, req.phone2, req.whatsapp, 
+              req.facebook, req.category, req.vegetarian_type, req.price_range, json.dumps(req.diet_tags), json.dumps(req.food_tags), 
+              json.dumps(req.facility_tags), json.dumps(req.time_slots), req.working_hours_text, json.dumps(req.rest_days), 
+              req.intro, req.status, req.verification, req.owner_name, req.owner_phone, req.admin_notes, user['uid'], restaurant_id)
+    try: cursor.execute(sql, params); db.commit(); return {"ok": True}
+    finally: cursor.close(); db.close()
+
+@app.get("/api/favorites")
+def list_favorites(user: dict = Depends(get_current_user)):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT restaurant_id FROM favorites WHERE user_id = %s", (user['uid'],))
+    ids = [r['restaurant_id'] for r in cursor.fetchall()]; cursor.close(); db.close(); return {"ids": ids}
+
+@app.post("/api/favorites/{restaurant_id}")
+def toggle_favorite(restaurant_id: int, user: dict = Depends(get_current_user)):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT id FROM favorites WHERE user_id = %s AND restaurant_id = %s", (user['uid'], restaurant_id))
+    row = cursor.fetchone()
+    if row: cursor.execute("DELETE FROM favorites WHERE id = %s", (row['id'],)); status = "removed"
+    else: cursor.execute("INSERT INTO favorites (user_id, restaurant_id) VALUES (%s, %s)", (user['uid'], restaurant_id)); status = "added"
+    db.commit(); cursor.close(); db.close(); return {"ok": True, "status": status}
+
+@app.get("/api/states/{state_id}/areas")
+def list_areas(state_id: int):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM areas WHERE state_id = %s ORDER BY name", (state_id,))
+    rows = cursor.fetchall(); cursor.close(); db.close(); return rows
+
+@app.get("/api/tags")
+def list_tags(type: Optional[str] = None):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    where = "WHERE is_active = 1"
+    if type: where += f" AND type = '{type}'"
+    cursor.execute(f"SELECT * FROM tags {where} ORDER BY type, sort_order, name")
+    rows = cursor.fetchall(); cursor.close(); db.close(); return rows
+
+@app.get("/api/notices")
+def list_notices(active_only: bool = True):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    where = "WHERE deleted_at IS NULL AND is_active = 1" if active_only else "WHERE deleted_at IS NULL"
+    cursor.execute(f"SELECT * FROM notices {where} ORDER BY priority DESC, created_at DESC")
+    rows = cursor.fetchall()
+    for r in rows:
+        if isinstance(r.get('links'), str): r['links'] = json.loads(r['links'])
+    cursor.close(); db.close(); return rows
+
+class NoticePayload(BaseModel):
+    type: str = "banner"  # banner | popup
+    content: Optional[str] = ""
+    info: Optional[str] = ""
+    image_url: Optional[str] = ""
+    link_name: Optional[str] = ""
+    links: list[dict] = []
+    is_active: bool = True
+    priority: int = 0
+
+@app.post("/api/admin/notices")
+def admin_create_notice(req: NoticePayload, user: dict = Depends(verify_token)):
+    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
+    db = get_db(); cursor = db.cursor()
+    sql = "INSERT INTO notices (type, content, info, image_url, link_name, links, is_active, priority, created_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+    params = (req.type, req.content, req.info, req.image_url, req.link_name, json.dumps(req.links), req.is_active, req.priority, user['uid'])
+    try: cursor.execute(sql, params); db.commit(); return {"ok": True, "id": cursor.lastrowid}
+    finally: cursor.close(); db.close()
+
+@app.put("/api/admin/notices/{notice_id}")
+def admin_update_notice(notice_id: int, req: NoticePayload, user: dict = Depends(verify_token)):
+    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
+    db = get_db(); cursor = db.cursor()
+    sql = "UPDATE notices SET type=%s, content=%s, info=%s, image_url=%s, link_name=%s, links=%s, is_active=%s, priority=%s WHERE id=%s"
+    params = (req.type, req.content, req.info, req.image_url, req.link_name, json.dumps(req.links), req.is_active, req.priority, notice_id)
+    try: cursor.execute(sql, params); db.commit(); return {"ok": True}
+    finally: cursor.close(); db.close()
+
+@app.delete("/api/admin/notices/{notice_id}")
+def admin_delete_notice(notice_id: int, user: dict = Depends(verify_token)):
+    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
+    db = get_db(); cursor = db.cursor()
+    try: cursor.execute("UPDATE notices SET deleted_at=NOW() WHERE id=%s", (notice_id,)); db.commit(); return {"ok": True}
+    finally: cursor.close(); db.close()
+
+class FeedbackSubmission(BaseModel):
+    type: str; message: str; contact: Optional[str] = None
+
+@app.post("/api/feedback")
+def submit_feedback(req: FeedbackSubmission, user: dict = Depends(verify_token_or_key)):
+    db = get_db(); cursor = db.cursor()
+    sql = "INSERT INTO feedback (user_id, type, message, contact) VALUES (%s, %s, %s, %s)"
+    uid = user.get('uid')
+    cursor.execute(sql, (uid, req.type, req.message, req.contact))
+    db.commit(); cursor.close(); db.close(); return {"ok": True}
+
+class ReportSubmission(BaseModel):
+    restaurant_id: int; issue_type: str; details: Optional[str] = None; contact: Optional[str] = None
+
+@app.post("/api/reports")
+def submit_report(req: ReportSubmission, user: dict = Depends(verify_token_or_key)):
+    db = get_db(); cursor = db.cursor()
+    sql = "INSERT INTO reports (restaurant_id, user_id, issue_type, details, contact) VALUES (%s, %s, %s, %s, %s)"
+    uid = user.get('uid')
+    cursor.execute(sql, (req.restaurant_id, uid, req.issue_type, req.details, req.contact))
+    db.commit(); cursor.close(); db.close(); return {"ok": True}
+
+class StatusUpdate(BaseModel):
+    status: str; admin_notes: Optional[str] = None
+
+@app.post("/api/admin/restaurants/{restaurant_id}/status")
+def update_restaurant_status(restaurant_id: int, req: StatusUpdate, user: dict = Depends(verify_token)):
+    if user.get('role') != 'admin': raise HTTPException(status_code=403, detail="Admin only")
+    db = get_db(); cursor = db.cursor()
+    sql = "UPDATE restaurants SET status = %s, admin_notes = %s, reviewed_by = %s, reviewed_at = NOW() WHERE id = %s"
+    cursor.execute(sql, (req.status, req.admin_notes, user['uid'], restaurant_id))
+    db.commit(); cursor.close(); db.close(); return {"ok": True}
+
+import os, uuid as _uuid
+
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+@app.post("/api/upload")
+async def upload_photo(file: UploadFile = File(...), user: dict = Depends(verify_token)):
+    ext = os.path.splitext(file.filename or "photo.jpg")[1] or ".jpg"
+    filename = f"{_uuid.uuid4().hex}{ext}"
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    content = await file.read()
+    with open(filepath, "wb") as f:
+        f.write(content)
+    url = f"/uploads/{filename}"
+    return {"ok": True, "url": url, "filename": filename}
+
+@app.post("/api/restaurants/{restaurant_id}/photos")
+def add_restaurant_photos(restaurant_id: int, urls: list[str], user: dict = Depends(verify_token)):
+    db = get_db(); cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT photos, cover_photo FROM restaurants WHERE id=%s", (restaurant_id,))
+    row = cursor.fetchone()
+    if not row: raise HTTPException(status_code=404, detail="Not found")
+    existing = json.loads(row['photos']) if row['photos'] else []
+    existing.extend(urls)
+    cover = row['cover_photo'] or (urls[0] if urls else None)
+    cursor.execute("UPDATE restaurants SET photos=%s, cover_photo=%s WHERE id=%s", (json.dumps(existing), cover, restaurant_id))
+    db.commit(); cursor.close(); db.close()
+    return {"ok": True, "photos": existing}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
